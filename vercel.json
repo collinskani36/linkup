@@ -1,0 +1,6 @@
+{
+  "rewrites": [
+    { "source": "/vibe/:id", "destination": "/api/vibe?id=:id" },
+    { "source": "/((?!api/|assets/|.*\\..*).*)", "destination": "/index.html" }
+  ]
+}
