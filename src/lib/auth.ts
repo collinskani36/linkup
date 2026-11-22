@@ -29,6 +29,41 @@ function friendly(error: ErrorLike, fallback: string): string {
   return fallback;
 }
 
+const RATE_LIMITED = "Too many attempts. Please wait a minute and try again.";
+const SERVER_TROUBLE = "Something went wrong on our side. Please try again in a moment.";
+
+type ApiResult = { status: number; body: Record<string, unknown> };
+
+/** Talks to our own server route (api/auth.js), which looks up emails and handles resets safely. */
+async function callAuthApi(action: string, payload: Record<string, unknown>): Promise<ApiResult> {
+  let response: Response;
+  try {
+    response = await fetch("/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, ...payload }),
+    });
+  } catch {
+    throw new AuthError("Can’t reach LinkUp right now. Check your connection and try again.");
+  }
+  let body: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = await response.json();
+    if (parsed && typeof parsed === "object") body = parsed as Record<string, unknown>;
+  } catch {
+    // Not JSON (for example the route isn't deployed yet): treated as a server problem below.
+  }
+  return { status: response.status, body };
+}
+
+function readSession(value: unknown): { access_token: string; refresh_token: string } | null {
+  if (!value || typeof value !== "object") return null;
+  const { access_token, refresh_token } = value as Record<string, unknown>;
+  return typeof access_token === "string" && typeof refresh_token === "string"
+    ? { access_token, refresh_token }
+    : null;
+}
+
 export async function isUsernameAvailable(username: string): Promise<boolean> {
   const { data, error } = await supabase.rpc("username_available", {
     p_username: normalizeUsername(username),
@@ -104,31 +139,64 @@ export async function resendSignupOtp(email: string): Promise<void> {
   if (error) throw new AuthError(friendly(error, "Couldn’t send a new code. Try again shortly."));
 }
 
-/** Log in with a username or an email address. */
+/** Log in with a username or an email address. The username lookup happens on the server. */
 export async function signIn(identifier: string, password: string): Promise<void> {
-  let email = identifier.trim();
+  const { status, body } = await callAuthApi("login", { identifier: identifier.trim(), password });
 
-  if (!email.includes("@")) {
-    const { data, error } = await supabase.rpc("get_login_email", {
-      p_username: normalizeUsername(email),
-    });
-    if (error) throw new AuthError(friendly(error, WRONG_CREDENTIALS));
-    if (!data) throw new AuthError(WRONG_CREDENTIALS);
-    email = data as string;
+  if (status === 200) {
+    const session = readSession(body.session);
+    if (!session) throw new AuthError(SERVER_TROUBLE);
+    const { error } = await supabase.auth.setSession(session);
+    if (error) throw new AuthError(friendly(error, "Couldn’t log you in. Please try again."));
+    return;
   }
+  if (status === 403 && body.code === "email_not_confirmed" && typeof body.email === "string") {
+    throw new AuthError(
+      "Confirm your email first — we’ll send you a new code.",
+      "email_not_confirmed",
+      body.email,
+    );
+  }
+  if (status === 429) throw new AuthError(RATE_LIMITED);
+  if (status === 401 || status === 400) throw new AuthError(WRONG_CREDENTIALS);
+  throw new AuthError(SERVER_TROUBLE);
+}
 
-  const { error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) {
-    const message = (error.message ?? "").toLowerCase();
-    if (error.code === "email_not_confirmed" || message.includes("not confirmed")) {
-      throw new AuthError(
-        "Confirm your email first — we’ll send you a new code.",
-        "email_not_confirmed",
-        email,
-      );
-    }
-    throw new AuthError(friendly(error, WRONG_CREDENTIALS));
+/**
+ * Emails a 6-digit reset code to the account's email. Always looks the same whether or not the
+ * account exists, so nobody can use it to find out who is on LinkUp.
+ */
+export async function requestPasswordReset(identifier: string): Promise<void> {
+  const { status } = await callAuthApi("forgot", { identifier: identifier.trim() });
+  if (status === 200) return;
+  if (status === 400) throw new AuthError("Enter your username or email.");
+  if (status === 429) throw new AuthError(RATE_LIMITED);
+  throw new AuthError(SERVER_TROUBLE);
+}
+
+export type ResetPasswordInput = { identifier: string; code: string; password: string };
+
+/** Checks the emailed code and sets the new password. The user then logs in as normal. */
+export async function resetPassword(input: ResetPasswordInput): Promise<void> {
+  const { status, body } = await callAuthApi("reset", {
+    identifier: input.identifier.trim(),
+    code: input.code.trim(),
+    password: input.password,
+  });
+  if (status === 200) return;
+  if (body.code === "invalid_code") {
+    throw new AuthError("That code didn’t work. Check it or ask for a new one.");
   }
+  if (body.code === "same_password") {
+    throw new AuthError(
+      "That’s your current password. Ask for a new code and choose a different one.",
+    );
+  }
+  if (body.code === "weak_password") {
+    throw new AuthError("That password is too weak. Try a longer one.");
+  }
+  if (status === 429) throw new AuthError(RATE_LIMITED);
+  throw new AuthError(SERVER_TROUBLE);
 }
 
 export async function signOut(): Promise<void> {

@@ -10,7 +10,9 @@ import crewPhoto from "@/assets/linkup-crew.jpg";
 import {
   AuthError,
   isUsernameAvailable,
+  requestPasswordReset,
   resendSignupOtp,
+  resetPassword,
   signIn,
   signUp,
   verifySignupOtp,
@@ -24,7 +26,7 @@ import {
   usernameProblem,
 } from "@/lib/auth-utils";
 
-type Mode = "signup" | "login" | "otp";
+type Mode = "signup" | "login" | "otp" | "forgot" | "reset";
 type UsernameStatus = "idle" | "checking" | "ok" | "taken";
 
 const message = (error: unknown, fallback: string) =>
@@ -34,6 +36,13 @@ export function AuthScreen() {
   const [mode, setMode] = useState<Mode>("signup");
   const [otpEmail, setOtpEmail] = useState("");
   const [notice, setNotice] = useState("");
+  const [loginNotice, setLoginNotice] = useState("");
+  const [resetIdentifier, setResetIdentifier] = useState("");
+
+  const showLogin = (text = "") => {
+    setLoginNotice(text);
+    setMode("login");
+  };
 
   const goToOtp = (email: string, text = "") => {
     setOtpEmail(email);
@@ -88,14 +97,34 @@ export function AuthScreen() {
           </div>
 
           {mode === "signup" && (
-            <SignupForm onNeedOtp={(email) => goToOtp(email)} onSwitch={() => setMode("login")} />
+            <SignupForm onNeedOtp={(email) => goToOtp(email)} onSwitch={() => showLogin()} />
           )}
           {mode === "login" && (
             <LoginForm
+              initialIdentifier={resetIdentifier}
+              notice={loginNotice}
               onNeedOtp={(email) =>
                 goToOtp(email, "Your email isn’t confirmed yet — we’ve sent a new code.")
               }
               onSwitch={() => setMode("signup")}
+              onForgot={() => setMode("forgot")}
+            />
+          )}
+          {mode === "forgot" && (
+            <ForgotForm
+              initialIdentifier={resetIdentifier}
+              onSent={(identifier) => {
+                setResetIdentifier(identifier);
+                setMode("reset");
+              }}
+              onBack={() => showLogin()}
+            />
+          )}
+          {mode === "reset" && (
+            <ResetForm
+              identifier={resetIdentifier}
+              onDone={() => showLogin("Password updated. Log in with your new password.")}
+              onBack={() => setMode("forgot")}
             />
           )}
           {mode === "otp" && (
@@ -341,13 +370,19 @@ function SignupForm({
 }
 
 function LoginForm({
+  initialIdentifier,
+  notice,
   onNeedOtp,
   onSwitch,
+  onForgot,
 }: {
+  initialIdentifier: string;
+  notice: string;
   onNeedOtp: (email: string) => void;
   onSwitch: () => void;
+  onForgot: () => void;
 }) {
-  const [identifier, setIdentifier] = useState("");
+  const [identifier, setIdentifier] = useState(initialIdentifier);
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -408,7 +443,17 @@ function LoginForm({
         onChange={(e) => setPassword(e.target.value)}
         className="form-input"
       />
+      <p className="signup-switch" style={{ marginTop: 8, textAlign: "right" }}>
+        <button type="button" onClick={onForgot}>
+          Forgot password?
+        </button>
+      </p>
 
+      {notice && !error && (
+        <p className="signup-footnote" role="status" style={{ justifyContent: "flex-start" }}>
+          {notice}
+        </p>
+      )}
       {error && <FieldError>{error}</FieldError>}
       <Button type="submit" className="primary-cta" disabled={busy}>
         {busy ? (
@@ -425,6 +470,208 @@ function LoginForm({
         New here?{" "}
         <button type="button" onClick={onSwitch}>
           Create an account <ArrowUpRight size={13} />
+        </button>
+      </p>
+    </form>
+  );
+}
+
+function ForgotForm({
+  initialIdentifier,
+  onSent,
+  onBack,
+}: {
+  initialIdentifier: string;
+  onSent: (identifier: string) => void;
+  onBack: () => void;
+}) {
+  const [identifier, setIdentifier] = useState(initialIdentifier);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!identifier.trim()) {
+      setError("Enter your username or email.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await requestPasswordReset(identifier);
+      onSent(identifier.trim());
+    } catch (err) {
+      setError(message(err, "Couldn’t send a code. Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="signup-form" onSubmit={submit} noValidate>
+      <FormHeading mark="↺" title="Forgot your password?">
+        Enter your username or email and we’ll send a 6-digit code to the email on your account.
+      </FormHeading>
+
+      <label className="field-label" htmlFor="forgot-identifier">
+        Username or email
+      </label>
+      <Input
+        id="forgot-identifier"
+        autoComplete="username"
+        autoCapitalize="none"
+        autoFocus
+        value={identifier}
+        onChange={(e) => setIdentifier(e.target.value)}
+        className="form-input"
+      />
+
+      {error && <FieldError>{error}</FieldError>}
+      <Button type="submit" className="primary-cta" disabled={busy}>
+        {busy ? (
+          <>
+            <Loader2 size={17} className="animate-spin" /> Sending…
+          </>
+        ) : (
+          <>
+            Send reset code <ArrowUpRight size={17} />
+          </>
+        )}
+      </Button>
+
+      <p className="signup-switch">
+        <button type="button" onClick={onBack}>
+          <ArrowLeft size={13} /> Back to log in
+        </button>
+      </p>
+    </form>
+  );
+}
+
+const RESET_RESEND_SECONDS = 60;
+
+function ResetForm({
+  identifier,
+  onDone,
+  onBack,
+}: {
+  identifier: string;
+  onDone: () => void;
+  onBack: () => void;
+}) {
+  const [code, setCode] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [cooldown, setCooldown] = useState(RESET_RESEND_SECONDS);
+
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const timer = window.setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => window.clearTimeout(timer);
+  }, [cooldown]);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (busy) return;
+    if (code.length !== 6) {
+      setError("Enter the 6-digit code from your email.");
+      return;
+    }
+    const problem = passwordProblem(password);
+    if (problem) {
+      setError(problem);
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setInfo("");
+    try {
+      await resetPassword({ identifier, code, password });
+      onDone();
+    } catch (err) {
+      setError(message(err, "Couldn’t reset your password. Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resend = async () => {
+    setError("");
+    setInfo("");
+    try {
+      await requestPasswordReset(identifier);
+      setInfo("New code requested. Check your inbox (and spam).");
+      setCooldown(RESET_RESEND_SECONDS);
+    } catch (err) {
+      setError(message(err, "Couldn’t send a new code."));
+    }
+  };
+
+  return (
+    <form className="signup-form" onSubmit={submit} noValidate>
+      <FormHeading mark="↺" title="Check your email">
+        If an account matches <strong>{identifier}</strong>, we’ve sent a 6-digit code to its email.
+        It can take a minute.
+      </FormHeading>
+
+      <div className="mt-6 flex justify-center">
+        <InputOTP
+          maxLength={6}
+          value={code}
+          onChange={setCode}
+          pattern={REGEXP_ONLY_DIGITS}
+          inputMode="numeric"
+          autoFocus
+          disabled={busy}
+          aria-label="6-digit reset code"
+        >
+          <InputOTPGroup>
+            {[0, 1, 2, 3, 4, 5].map((index) => (
+              <InputOTPSlot key={index} index={index} />
+            ))}
+          </InputOTPGroup>
+        </InputOTP>
+      </div>
+
+      <label className="field-label" htmlFor="reset-password">
+        New password
+      </label>
+      <Input
+        id="reset-password"
+        type="password"
+        placeholder="At least 8 characters"
+        autoComplete="new-password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        className="form-input"
+      />
+
+      {info && <p className="signup-footnote">{info}</p>}
+      {error && <FieldError>{error}</FieldError>}
+
+      <Button type="submit" className="primary-cta" disabled={busy}>
+        {busy ? (
+          <>
+            <Loader2 size={17} className="animate-spin" /> Updating…
+          </>
+        ) : (
+          <>
+            Update password <ArrowUpRight size={17} />
+          </>
+        )}
+      </Button>
+
+      <p className="signup-switch">
+        Didn’t get it?{" "}
+        <button type="button" onClick={resend} disabled={cooldown > 0}>
+          {cooldown > 0 ? `Resend in ${cooldown}s` : "Resend code"}
+        </button>
+      </p>
+      <p className="signup-switch" style={{ marginTop: 10 }}>
+        <button type="button" onClick={onBack}>
+          <ArrowLeft size={13} /> Use a different username or email
         </button>
       </p>
     </form>

@@ -9,6 +9,8 @@ const auth = vi.hoisted(() => ({
   signIn: vi.fn(),
   verifySignupOtp: vi.fn(),
   resendSignupOtp: vi.fn(),
+  requestPasswordReset: vi.fn(),
+  resetPassword: vi.fn(),
 }));
 
 vi.mock("@/lib/auth", async () => {
@@ -66,5 +68,66 @@ describe("AuthScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Log in/ }));
 
     await waitFor(() => expect(auth.signIn).toHaveBeenCalledWith("wanjiku_m", "supersecret"));
+  });
+  it("walks through forgot password: request a code, set a new password, back to login", async () => {
+    auth.requestPasswordReset.mockResolvedValue(undefined);
+    auth.resetPassword.mockResolvedValue(undefined);
+    render(<AuthScreen />);
+
+    fireEvent.click(screen.getByText("Log in"));
+    fireEvent.click(screen.getByText("Forgot password?"));
+    expect(await screen.findByText("Forgot your password?")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Send reset code/ }));
+    expect(await screen.findByText("Enter your username or email.")).toBeTruthy();
+    expect(auth.requestPasswordReset).not.toHaveBeenCalled();
+
+    fill("Username or email", "wanjiku_m");
+    fireEvent.click(screen.getByRole("button", { name: /^Send reset code/ }));
+    expect(await screen.findByText("Check your email")).toBeTruthy();
+    expect(auth.requestPasswordReset).toHaveBeenCalledWith("wanjiku_m");
+
+    fill("New password", "short");
+    fireEvent.change(screen.getByLabelText("6-digit reset code"), { target: { value: "123456" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Update password/ }));
+    expect(await screen.findByText("Use at least 8 characters.")).toBeTruthy();
+    expect(auth.resetPassword).not.toHaveBeenCalled();
+
+    fill("New password", "brandnewpass");
+    fireEvent.click(screen.getByRole("button", { name: /^Update password/ }));
+    await waitFor(() =>
+      expect(auth.resetPassword).toHaveBeenCalledWith({
+        identifier: "wanjiku_m",
+        code: "123456",
+        password: "brandnewpass",
+      }),
+    );
+    expect(
+      await screen.findByText("Password updated. Log in with your new password."),
+    ).toBeTruthy();
+    expect((screen.getByLabelText("Username or email") as HTMLInputElement).value).toBe(
+      "wanjiku_m",
+    );
+  });
+
+  it("shows the server's message when the reset code is wrong", async () => {
+    auth.requestPasswordReset.mockResolvedValue(undefined);
+    auth.resetPassword.mockRejectedValue(
+      new Error("That code didn’t work. Check it or ask for a new one."),
+    );
+    render(<AuthScreen />);
+
+    fireEvent.click(screen.getByText("Log in"));
+    fireEvent.click(screen.getByText("Forgot password?"));
+    fill("Username or email", "wanjiku@example.com");
+    fireEvent.click(screen.getByRole("button", { name: /^Send reset code/ }));
+    await screen.findByText("Check your email");
+
+    fireEvent.change(screen.getByLabelText("6-digit reset code"), { target: { value: "000000" } });
+    fill("New password", "brandnewpass");
+    fireEvent.click(screen.getByRole("button", { name: /^Update password/ }));
+    expect(
+      await screen.findByText("That code didn’t work. Check it or ask for a new one."),
+    ).toBeTruthy();
   });
 });
